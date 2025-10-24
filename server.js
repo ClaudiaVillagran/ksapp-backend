@@ -14,28 +14,25 @@ app.use(express.urlencoded({ extended: true }));
 const FLOW_CREATE_URL = "https://sandbox.flow.cl/api/payment/create";
 const FLOW_STATUS_URL = "https://sandbox.flow.cl/api/payment/getStatus";
 
-const { FLOW_API_KEY, FLOW_SECRET_KEY, URL_RETURN, URL_CONFIRM, PORT } = process.env;
+const {
+  FLOW_API_KEY,
+  FLOW_SECRET_KEY,
+  URL_RETURN,
+  URL_CONFIRM,
+  PORT
+} = process.env;
 
-// ─── HELPERS: FIRMA EXACTA ─────────────────────────────────────────
-// Construye un objeto de params ordenado por clave ASC
-function orderedParams(obj) {
-  const out = {};
-  for (const k of Object.keys(obj).sort()) out[k] = obj[k];
-  return out;
-}
-
-// Construye un querystring usando SIEMPRE URLSearchParams (mismo mecanismo)
-function toQueryStringOrdered(paramsObj) {
-  const search = new URLSearchParams();
-  for (const k of Object.keys(paramsObj)) {
-    search.append(k, paramsObj[k]);
+// ─── UTILS DE FIRMA SEGÚN DOC OFICIAL ─────────────────────────────
+// 1) Ordena alfabéticamente las claves
+// 2) Concatena "clave + valor" (sin separadores)
+// 3) HMAC-SHA256(secret) -> hex minúsculas
+function signParams(params, secret) {
+  const keys = Object.keys(params).sort();
+  let toSign = "";
+  for (const k of keys) {
+    toSign += k + String(params[k]);
   }
-  return search.toString(); // ej: amount=10000&apiKey=...&...
-}
-
-// Firma HMAC-SHA256 en MAYÚSCULAS sobre el querystring FINAL
-function hmacHexUpper(qs, secret) {
-  return crypto.createHmac("sha256", secret).update(qs).digest("hex").toUpperCase();
+  return crypto.createHmac("sha256", secret).update(toSign).digest("hex"); // hex minúsculas
 }
 
 // ─── RUTAS DE SALUD/DIAGNÓSTICO ────────────────────────────────────
@@ -63,36 +60,29 @@ app.post("/api/payments/flow/create", async (req, res) => {
       console.error("Faltan llaves de Flow en ENV");
       return res.status(500).json({ ok: false, error: "Faltan llaves de Flow en ENV" });
     }
+
     const amt = Math.trunc(Number(amount));
     if (!amt || amt < 1 || !email || !orderId) {
       return res.status(400).json({ ok: false, error: "amount>=1, email y orderId son obligatorios" });
     }
 
-    // Base de parámetros (en texto “limpio”)
-    const baseParams = {
+    // Base de parámetros SIN s
+    const base = {
       apiKey: String(FLOW_API_KEY),
-      amount: String(amt),                     // entero CLP
       commerceOrder: String(orderId),
-      currency: "CLP",
-      email: String(email),
       subject: (description || "Pago KSAPP").toString(),
-      urlConfirmation: String(URL_CONFIRM),
+      currency: "CLP",
+      amount: String(amt),               // CLP entero
+      email: String(email),
       urlReturn: String(URL_RETURN),
+      urlConfirmation: String(URL_CONFIRM),
     };
 
-    // 1) Ordena -> 2) Construye QS -> 3) Firma en UPPER
-    const ordered = orderedParams(baseParams);
-    const qs = toQueryStringOrdered(ordered);
-    const s = hmacHexUpper(qs, FLOW_SECRET_KEY);
+    // Firma correcta (concat clave+valor ordenados)
+    const s = signParams(base, FLOW_SECRET_KEY);
 
-    // 4) Cuerpo final = MISMO QS + s (mismo mecanismo)
-    const withSig = new URLSearchParams(qs);
-    withSig.append("s", s);
-    const body = withSig.toString();
-
-    // (Debug opcional mientras pruebas)
-    // console.log("FLOW qs:", qs);
-    // console.log("FLOW s:", s);
+    // Envío x-www-form-urlencoded
+    const body = new URLSearchParams({ ...base, s }).toString();
 
     const r = await axios.post(FLOW_CREATE_URL, body, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -123,6 +113,7 @@ app.get("/api/payments/flow/confirm", (_req, res) => {
 
 app.post("/api/payments/flow/confirm", async (req, res) => {
   try {
+    // Flow hace POST x-www-form-urlencoded; token puede venir en body o query
     const token = req.body?.token || req.query?.token;
     if (!token) return res.sendStatus(400);
 
@@ -130,13 +121,9 @@ app.post("/api/payments/flow/confirm", async (req, res) => {
       apiKey: String(FLOW_API_KEY),
       token: String(token),
     };
-    const ordered = orderedParams(base);
-    const qs = toQueryStringOrdered(ordered);
-    const s = hmacHexUpper(qs, FLOW_SECRET_KEY);
+    const s = signParams(base, FLOW_SECRET_KEY);
 
-    const withSig = new URLSearchParams(qs);
-    withSig.append("s", s);
-    const body = withSig.toString();
+    const body = new URLSearchParams({ ...base, s }).toString();
 
     const statusResp = await axios.post(FLOW_STATUS_URL, body, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },

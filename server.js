@@ -16,12 +16,34 @@ const FLOW_STATUS_URL = "https://sandbox.flow.cl/api/payment/getStatus";
 
 const { FLOW_API_KEY, FLOW_SECRET_KEY, URL_RETURN, URL_CONFIRM, PORT } = process.env;
 
+// ─── HELPERS: FIRMA EXACTA ─────────────────────────────────────────
+// Construye un objeto de params ordenado por clave ASC
+function orderedParams(obj) {
+  const out = {};
+  for (const k of Object.keys(obj).sort()) out[k] = obj[k];
+  return out;
+}
+
+// Construye un querystring usando SIEMPRE URLSearchParams (mismo mecanismo)
+function toQueryStringOrdered(paramsObj) {
+  const search = new URLSearchParams();
+  for (const k of Object.keys(paramsObj)) {
+    search.append(k, paramsObj[k]);
+  }
+  return search.toString(); // ej: amount=10000&apiKey=...&...
+}
+
+// Firma HMAC-SHA256 en MAYÚSCULAS sobre el querystring FINAL
+function hmacHexUpper(qs, secret) {
+  return crypto.createHmac("sha256", secret).update(qs).digest("hex").toUpperCase();
+}
+
 // ─── RUTAS DE SALUD/DIAGNÓSTICO ────────────────────────────────────
-app.get("/", (req, res) => res.send("OK KSAPP-BACKEND"));
-app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/", (_req, res) => res.send("OK KSAPP-BACKEND"));
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // No muestra valores, solo confirma presencia
-app.get("/diag/env", (req, res) => {
+app.get("/diag/env", (_req, res) => {
   res.json({
     hasApiKey: !!FLOW_API_KEY,
     hasSecret: !!FLOW_SECRET_KEY,
@@ -29,20 +51,6 @@ app.get("/diag/env", (req, res) => {
     urlConfirm: URL_CONFIRM || null,
   });
 });
-
-// ─── FIRMA HMAC SHA256 ─────────────────────────────────────────────
-function signParams(params, secret) {
-  // 1) Ordena por clave ascendente
-  const sortedKeys = Object.keys(params).sort();
-  const sorted = {};
-  for (const k of sortedKeys) sorted[k] = params[k];
-
-  // 2) Querystring "k=v&k2=v2"
-  const qs = new URLSearchParams(sorted).toString();
-
-  // 3) HMAC-SHA256 (hex)
-  return crypto.createHmac("sha256", secret).update(qs).digest("hex");
-}
 
 // ─── CREAR LINK DE PAGO ────────────────────────────────────────────
 app.post("/api/payments/flow/create", async (req, res) => {
@@ -55,27 +63,36 @@ app.post("/api/payments/flow/create", async (req, res) => {
       console.error("Faltan llaves de Flow en ENV");
       return res.status(500).json({ ok: false, error: "Faltan llaves de Flow en ENV" });
     }
-    if (!amount || !email || !orderId) {
-      return res.status(400).json({ ok: false, error: "amount, email y orderId son obligatorios" });
+    const amt = Math.trunc(Number(amount));
+    if (!amt || amt < 1 || !email || !orderId) {
+      return res.status(400).json({ ok: false, error: "amount>=1, email y orderId son obligatorios" });
     }
 
-    // Base de parámetros según doc de Flow
-    const base = {
-      apiKey: FLOW_API_KEY,
+    // Base de parámetros (en texto “limpio”)
+    const baseParams = {
+      apiKey: String(FLOW_API_KEY),
+      amount: String(amt),                     // entero CLP
       commerceOrder: String(orderId),
-      subject: description || "Pago KSAPP",
       currency: "CLP",
-      amount: String(Number(amount)), // en CLP
       email: String(email),
-      urlReturn: URL_RETURN,
-      urlConfirmation: URL_CONFIRM,
+      subject: (description || "Pago KSAPP").toString(),
+      urlConfirmation: String(URL_CONFIRM),
+      urlReturn: String(URL_RETURN),
     };
 
-    // Firma
-    const s = signParams(base, FLOW_SECRET_KEY);
+    // 1) Ordena -> 2) Construye QS -> 3) Firma en UPPER
+    const ordered = orderedParams(baseParams);
+    const qs = toQueryStringOrdered(ordered);
+    const s = hmacHexUpper(qs, FLOW_SECRET_KEY);
 
-    // Body x-www-form-urlencoded (muchos endpoints de Flow lo piden así)
-    const body = new URLSearchParams({ ...base, s }).toString();
+    // 4) Cuerpo final = MISMO QS + s (mismo mecanismo)
+    const withSig = new URLSearchParams(qs);
+    withSig.append("s", s);
+    const body = withSig.toString();
+
+    // (Debug opcional mientras pruebas)
+    // console.log("FLOW qs:", qs);
+    // console.log("FLOW s:", s);
 
     const r = await axios.post(FLOW_CREATE_URL, body, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -94,13 +111,13 @@ app.post("/api/payments/flow/create", async (req, res) => {
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
     console.error("FLOW create error detail:", detail);
-    // DEVUELVE EL DETALLE (solo mientras pruebas). Luego vuelve a un mensaje genérico.
     return res.status(500).json({ ok: false, error: detail });
   }
 });
 
 // ─── WEBHOOK (CONFIRMACIÓN) ────────────────────────────────────────
-app.get("/api/payments/flow/confirm", (req, res) => {
+// GET solo para que no asuste si lo abres en navegador
+app.get("/api/payments/flow/confirm", (_req, res) => {
   res.send("Webhook listo. Flow usará POST con 'token'.");
 });
 
@@ -109,9 +126,17 @@ app.post("/api/payments/flow/confirm", async (req, res) => {
     const token = req.body?.token || req.query?.token;
     if (!token) return res.sendStatus(400);
 
-    const base = { apiKey: FLOW_API_KEY, token: String(token) };
-    const s = signParams(base, FLOW_SECRET_KEY);
-    const body = new URLSearchParams({ ...base, s }).toString();
+    const base = {
+      apiKey: String(FLOW_API_KEY),
+      token: String(token),
+    };
+    const ordered = orderedParams(base);
+    const qs = toQueryStringOrdered(ordered);
+    const s = hmacHexUpper(qs, FLOW_SECRET_KEY);
+
+    const withSig = new URLSearchParams(qs);
+    withSig.append("s", s);
+    const body = withSig.toString();
 
     const statusResp = await axios.post(FLOW_STATUS_URL, body, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },

@@ -1,46 +1,31 @@
-// ─── IMPORTS Y MIDDLEWARES ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// KSAPP Backend - Flow Sandbox Integration
+// ─────────────────────────────────────────────────────────────────────────────
+
 import express from "express";
 import cors from "cors";
 import axios from "axios";
 import crypto from "crypto";
-import "dotenv/config"; // si corres local con .env
+import "dotenv/config"; // lee .env en local
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─── CONSTS FLOW (SANDBOX) ─────────────────────────────────────────
+// ▸ Endpoints Flow (SANDBOX)
 const FLOW_CREATE_URL = "https://sandbox.flow.cl/api/payment/create";
-const FLOW_STATUS_URL = "https://sandbox.flow.cl/api/payment/getStatus";
+const FLOW_STATUS_BY_COMMERCE_URL = "https://sandbox.flow.cl/api/payment/getStatusByCommerceId";
 
-const {
-  FLOW_API_KEY,
-  FLOW_SECRET_KEY,
-  URL_RETURN,
-  URL_CONFIRM,
-  PORT
-} = process.env;
+// ▸ ENV
+const { FLOW_API_KEY, FLOW_SECRET_KEY, URL_RETURN, URL_CONFIRM, PORT } = process.env;
 
-// ─── UTILS DE FIRMA SEGÚN DOC OFICIAL ─────────────────────────────
-// 1) Ordena alfabéticamente las claves
-// 2) Concatena "clave + valor" (sin separadores)
-// 3) HMAC-SHA256(secret) -> hex minúsculas
-function signParams(params, secret) {
-  const keys = Object.keys(params).sort();
-  let toSign = "";
-  for (const k of keys) {
-    toSign += k + String(params[k]);
-  }
-  return crypto.createHmac("sha256", secret).update(toSign).digest("hex"); // hex minúsculas
-}
-
-// ─── RUTAS DE SALUD/DIAGNÓSTICO ────────────────────────────────────
-app.get("/", (_req, res) => res.send("OK KSAPP-BACKEND"));
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// No muestra valores, solo confirma presencia
-app.get("/diag/env", (_req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// Health & Diagnóstico
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.send("OK KSAPP-BACKEND"));
+app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/diag/env", (req, res) => {
   res.json({
     hasApiKey: !!FLOW_API_KEY,
     hasSecret: !!FLOW_SECRET_KEY,
@@ -49,39 +34,49 @@ app.get("/diag/env", (_req, res) => {
   });
 });
 
-// ─── CREAR LINK DE PAGO ────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Firma HMAC-SHA256 (Flow): concatenar "key"+"value" en orden alfabético
+// ─────────────────────────────────────────────────────────────────────────────
+function signParams(params, secret) {
+  const sortedKeys = Object.keys(params).sort();
+  let toSign = "";
+  for (const k of sortedKeys) toSign += k + params[k];
+  return crypto.createHmac("sha256", secret).update(toSign).digest("hex");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Crear link de pago
+// ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/payments/flow/create", async (req, res) => {
   try {
     const { amount, email, orderId, description } = req.body;
 
-    console.log("FLOW create body:", req.body);
-
     if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
-      console.error("Faltan llaves de Flow en ENV");
       return res.status(500).json({ ok: false, error: "Faltan llaves de Flow en ENV" });
     }
-
-    const amt = Math.trunc(Number(amount));
-    if (!amt || amt < 1 || !email || !orderId) {
-      return res.status(400).json({ ok: false, error: "amount>=1, email y orderId son obligatorios" });
+    if (!amount || !email || !orderId) {
+      return res.status(400).json({ ok: false, error: "amount, email y orderId son obligatorios" });
     }
 
-    // Base de parámetros SIN s
+    // Flow exige commerceOrder ≤ 45 chars: valida aquí por seguridad
+    if (String(orderId).length > 45) {
+      return res.status(400).json({ ok: false, error: "commerceOrder debe tener ≤ 45 caracteres" });
+    }
+
     const base = {
-      apiKey: String(FLOW_API_KEY),
+      apiKey: FLOW_API_KEY,
       commerceOrder: String(orderId),
-      subject: (description || "Pago KSAPP").toString(),
+      subject: description || "Pago KSAPP",
       currency: "CLP",
-      amount: String(amt),               // CLP entero
+      amount: String(Number(amount)),
       email: String(email),
-      urlReturn: String(URL_RETURN),
-      urlConfirmation: String(URL_CONFIRM),
+      urlReturn: URL_RETURN,
+      urlConfirmation: URL_CONFIRM,
     };
 
-    // Firma correcta (concat clave+valor ordenados)
     const s = signParams(base, FLOW_SECRET_KEY);
 
-    // Envío x-www-form-urlencoded
+    // Flow acepta x-www-form-urlencoded
     const body = new URLSearchParams({ ...base, s }).toString();
 
     const r = await axios.post(FLOW_CREATE_URL, body, {
@@ -89,15 +84,19 @@ app.post("/api/payments/flow/create", async (req, res) => {
       timeout: 20000,
     });
 
-    // Esperamos { url: "https://sandbox.flow.cl/btn/pay?token=..." }
-    if (!r?.data?.url) {
-      console.error("FLOW create unexpected response:", r?.data);
-      return res.status(502).json({ ok: false, error: "Flow no devolvió URL" });
+    const { url, token, flowOrder } = r?.data || {};
+    if (!url || !token) {
+      return res.status(502).json({ ok: false, error: "Flow no devolvió url/token" });
     }
 
-    console.log("FLOW payment URL:", r.data.url);
-    return res.json({ ok: true, paymentUrl: r.data.url });
-
+    const paymentUrl = `${url}?token=${token}`;
+    return res.json({
+      ok: true,
+      paymentUrl,
+      token,
+      commerceOrder: base.commerceOrder,
+      flowOrder: flowOrder || null,
+    });
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
     console.error("FLOW create error detail:", detail);
@@ -105,40 +104,45 @@ app.post("/api/payments/flow/create", async (req, res) => {
   }
 });
 
-// ─── WEBHOOK (CONFIRMACIÓN) ────────────────────────────────────────
-// GET solo para que no asuste si lo abres en navegador
-app.get("/api/payments/flow/confirm", (_req, res) => {
-  res.send("Webhook listo. Flow usará POST con 'token'.");
-});
-
-app.post("/api/payments/flow/confirm", async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// Consultar estado por commerceOrder (para polling desde la app)
+// status: 2=pagado, 1=pendiente, 3=cancelado, 4=rechazado
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/payments/flow/status", async (req, res) => {
   try {
-    // Flow hace POST x-www-form-urlencoded; token puede venir en body o query
-    const token = req.body?.token || req.query?.token;
-    if (!token) return res.sendStatus(400);
+    const commerceOrder = req.query.commerceOrder;
+    if (!commerceOrder) return res.status(400).json({ ok: false, error: "commerceOrder requerido" });
 
-    const base = {
-      apiKey: String(FLOW_API_KEY),
-      token: String(token),
-    };
-    const s = signParams(base, FLOW_SECRET_KEY);
+    const params = { apiKey: FLOW_API_KEY, commerceId: String(commerceOrder) };
+    const s = signParams(params, FLOW_SECRET_KEY);
+    const url = `${FLOW_STATUS_BY_COMMERCE_URL}?${new URLSearchParams({ ...params, s }).toString()}`;
 
-    const body = new URLSearchParams({ ...base, s }).toString();
-
-    const statusResp = await axios.post(FLOW_STATUS_URL, body, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 20000,
-    });
-
-    console.log("FLOW payment status:", statusResp.data); // status 2 = pagado
-    return res.sendStatus(200);
+    const r = await axios.get(url, { timeout: 15000 });
+    return res.json({ ok: true, status: r.data.status || 0, raw: r.data });
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
-    console.error("FLOW confirm error detail:", detail);
-    return res.sendStatus(500);
+    console.error("FLOW status error:", detail);
+    return res.status(500).json({ ok: false, error: detail });
   }
 });
 
-// ─── START ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// (Opcional) Webhook de confirmación (no necesario para el polling, pero útil)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/payments/flow/confirm", (req, res) => {
+  res.send("Webhook listo. Flow enviará POST con 'token'.");
+});
+
+app.post("/api/payments/flow/confirm", (req, res) => {
+  // Si más adelante quieres manejar webhooks, procesa req.body.token aquí:
+  //   - Llamar /payment/getStatus con token
+  //   - Actualizar base de datos
+  // Por ahora respondemos 200 para evitar reintentos infinitos.
+  return res.sendStatus(200);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Start
+// ─────────────────────────────────────────────────────────────────────────────
 const REAL_PORT = PORT || 3000;
 app.listen(REAL_PORT, () => console.log("KSAPP Flow API en puerto " + REAL_PORT));

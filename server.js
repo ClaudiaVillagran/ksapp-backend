@@ -1,5 +1,3 @@
-// server.js (versión resumida con lo clave para el status)
-
 import express from "express";
 import cors from "cors";
 import axios from "axios";
@@ -18,6 +16,9 @@ const FLOW_STATUS_BY_TOKEN = `${FLOW_BASE}/payment/getStatus`;
 
 const { FLOW_API_KEY, FLOW_SECRET_KEY, URL_RETURN, URL_CONFIRM, PORT } = process.env;
 
+// 🔸 Mapa en memoria: commerceOrder -> token (útil para consultar por token luego)
+const orderTokenMap = new Map();
+
 app.get("/", (_, res) => res.send("OK KSAPP-BACKEND"));
 app.get("/diag/env", (_, res) => {
   res.json({
@@ -30,7 +31,7 @@ app.get("/diag/env", (_, res) => {
 
 function signParamsConcat(params, secret) {
   const keys = Object.keys(params).sort();
-  const toSign = keys.map(k => `${k}${params[k]}`).join("");
+  const toSign = keys.map((k) => `${k}${params[k]}`).join("");
   return crypto.createHmac("sha256", secret).update(toSign).digest("hex");
 }
 
@@ -38,8 +39,12 @@ function signParamsConcat(params, secret) {
 app.post("/api/payments/flow/create", async (req, res) => {
   try {
     const { amount, email, orderId, description } = req.body;
-    if (!FLOW_API_KEY || !FLOW_SECRET_KEY) return res.status(500).json({ ok: false, error: "Faltan llaves de Flow" });
-    if (!amount || !email || !orderId) return res.status(400).json({ ok: false, error: "amount, email, orderId requeridos" });
+    if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
+      return res.status(500).json({ ok: false, error: "Faltan llaves de Flow" });
+    }
+    if (!amount || !email || !orderId) {
+      return res.status(400).json({ ok: false, error: "amount, email, orderId requeridos" });
+    }
 
     const payload = {
       apiKey: FLOW_API_KEY,
@@ -48,8 +53,8 @@ app.post("/api/payments/flow/create", async (req, res) => {
       currency: "CLP",
       amount: Number(amount),
       email: String(email),
-      urlReturn: URL_RETURN,
-      urlConfirmation: URL_CONFIRM,
+      urlReturn: URL_RETURN || "",        // puedes dejar vacío si dependes del polling
+      urlConfirmation: URL_CONFIRM || "", // PERO configúralo en Flow Sandbox
     };
     const s = signParamsConcat(payload, FLOW_SECRET_KEY);
     const body = new URLSearchParams({ ...payload, s }).toString();
@@ -59,8 +64,15 @@ app.post("/api/payments/flow/create", async (req, res) => {
       timeout: 20000,
     });
 
-    if (!r?.data?.url) return res.status(502).json({ ok: false, error: "Flow no devolvió URL" });
-    return res.json({ ok: true, paymentUrl: r.data.url });
+    if (!r?.data?.url || !r?.data?.token) {
+      console.error("FLOW create: respuesta sin url o token", r?.data);
+      return res.status(502).json({ ok: false, error: "Flow no devolvió URL y token" });
+    }
+
+    // Guardamos token en memoria para esa orden
+    orderTokenMap.set(String(orderId), String(r.data.token));
+
+    return res.json({ ok: true, paymentUrl: r.data.url, token: r.data.token });
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
     console.error("FLOW create error:", detail);
@@ -68,7 +80,7 @@ app.post("/api/payments/flow/create", async (req, res) => {
   }
 });
 
-// Webhook informativo (opcional)
+// Webhook informativo
 app.get("/api/payments/flow/confirm", (_, res) => {
   res.send("Webhook listo. Flow usará POST con 'token'.");
 });
@@ -76,15 +88,26 @@ app.get("/api/payments/flow/confirm", (_, res) => {
 app.post("/api/payments/flow/confirm", async (req, res) => {
   try {
     const token = req.body?.token || req.query?.token;
-    if (!token) return res.sendStatus(400);
+    if (!token) {
+      console.warn("CONFIRM sin token");
+      return res.sendStatus(400);
+    }
     const base = { apiKey: FLOW_API_KEY, token: String(token) };
     const s = signParamsConcat(base, FLOW_SECRET_KEY);
     const body = new URLSearchParams({ ...base, s }).toString();
+
     const r = await axios.post(FLOW_STATUS_BY_TOKEN, body, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       timeout: 20000,
     });
+
     console.log("FLOW confirm status:", r.data); // status 2 = pagado
+
+    // si viene commerceOrder, lo mapeamos también
+    if (r?.data?.commerceOrder && token) {
+      orderTokenMap.set(String(r.data.commerceOrder), String(token));
+    }
+
     return res.sendStatus(200);
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
@@ -93,19 +116,47 @@ app.post("/api/payments/flow/confirm", async (req, res) => {
   }
 });
 
-// 👇 NUEVO: consultar estado por commerceOrder (para el polling del front)
+/**
+ * Estado por commerceOrder O token.
+ * - Si recibimos token (o lo tenemos mapeado), consultamos por token (más fiable).
+ * - Si no, consultamos por commerceOrder.
+ * Responde: { ok, status, raw, via }
+ *
+ * status: 1=creado | 2=pagado | 3=rechazado | 4=anulado
+ */
 app.get("/api/payments/flow/status", async (req, res) => {
   try {
-    const commerceOrder = req.query?.commerceOrder;
-    if (!commerceOrder) return res.status(400).json({ ok: false, error: "commerceOrder requerido" });
+    const qOrder = req.query?.commerceOrder ? String(req.query.commerceOrder) : null;
+    const qToken = req.query?.token ? String(req.query.token) : null;
 
-    const params = { apiKey: FLOW_API_KEY, commerceId: String(commerceOrder) };
+    // ¿Tenemos token directo o desde el mapa?
+    const token = qToken || (qOrder ? orderTokenMap.get(qOrder) : null);
+
+    if (token) {
+      const base = { apiKey: FLOW_API_KEY, token };
+      const s = signParamsConcat(base, FLOW_SECRET_KEY);
+      const body = new URLSearchParams({ ...base, s }).toString();
+
+      const r = await axios.post(FLOW_STATUS_BY_TOKEN, body, {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 20000,
+      });
+      return res.json({ ok: true, status: r.data?.status ?? null, raw: r.data, via: "token" });
+    }
+
+    if (!qOrder) {
+      return res.status(400).json({ ok: false, error: "commerceOrder o token requerido" });
+    }
+
+    // fallback: por commerceOrder
+    const params = { apiKey: FLOW_API_KEY, commerceId: qOrder };
     const s = signParamsConcat(params, FLOW_SECRET_KEY);
-    const url = `${FLOW_STATUS_BY_COMMERCE}?apiKey=${encodeURIComponent(params.apiKey)}&commerceId=${encodeURIComponent(params.commerceId)}&s=${encodeURIComponent(s)}`;
+    const url = `${FLOW_STATUS_BY_COMMERCE}?apiKey=${encodeURIComponent(
+      params.apiKey
+    )}&commerceId=${encodeURIComponent(params.commerceId)}&s=${encodeURIComponent(s)}`;
 
     const r = await axios.get(url, { timeout: 20000 });
-    // r.data.status: 1 creado | 2 pagado | 3 rechazado | 4 anulado
-    return res.json({ ok: true, status: r.data?.status ?? null, raw: r.data });
+    return res.json({ ok: true, status: r.data?.status ?? null, raw: r.data, via: "commerceId" });
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
     console.error("FLOW status error:", detail);

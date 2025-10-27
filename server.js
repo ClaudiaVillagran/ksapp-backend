@@ -1,191 +1,153 @@
+// server.js
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");
-const crypto = require("crypto");
 
-const {
-  FLOW_API_KEY,
-  FLOW_SECRET_KEY,
-  URL_CONFIRM,
-  URL_RETURN,
-  PORT = 3000,
-} = process.env;
-
+// Express 5 ya trae body parsing integrado
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-/** === Utilidades para Flow ===
- * Firma HMAC-SHA256 con las "key=value" ordenadas alfabéticamente unidas por "&"
- */
-function buildSign(payloadObj, secret) {
-  const ordered = Object.keys(payloadObj)
-    .sort()
-    .map((k) => `${k}=${payloadObj[k]}`)
-    .join("&");
-  return crypto.createHmac("sha256", secret).update(ordered).digest("hex");
-}
+// ===== Transbank SDK =====
+const { WebpayPlus } = require("transbank-sdk"); // CommonJS
+const { v4: uuidv4 } = require("uuid");
 
-// Mapea status de Flow -> etiqueta comprensible
-function mapFlowStatus(status) {
-  // Basado en la doc de Flow:
-  // 1: created, 2: paid, 3: rejected, 4: canceled, 5: expired, 6: refunded (si aplica)
-  switch (Number(status)) {
-    case 2:
-      return "paid";
-    case 3:
-      return "rejected";
-    case 4:
-      return "canceled";
-    case 5:
-      return "expired";
-    default:
-      return "pending";
-  }
-}
+// ===== Config rápida (usa tus mismas keys) =====
+// Sube esto a variables de entorno cuando puedas:
+const COMMERCE_CODE = process.env.TBK_COMMERCE_CODE || "597050513381";
+const API_KEY = process.env.TBK_API_KEY || "515bda59-40b0-483f-acd0-6d305bc183af";
 
-const FLOW_BASE = "https://sandbox.flow.cl/api";
+// URL pública (https) de TU backend (la que ve Webpay):
+// ej: https://api.ksapp.cl
+const BASE_URL = process.env.BASE_URL || "https://ksa.cl/pago-return";
 
-/**
- * Crea orden en Flow y devuelve {token, url}
- * Body esperado:
- *  - commerceOrder (string)
- *  - subject (string)
- *  - email (string)
- *  - amount (number, en CLP)
- */
-app.post("/api/payments/flow/create", async (req, res) => {
+// Configura PRODUCCIÓN con tus credenciales
+WebpayPlus.configureForProduction(COMMERCE_CODE, API_KEY);
+
+// Si quisieras sandbox para pruebas rápidas (NO mezclar con prod):
+// const { IntegrationCommerceCodes, IntegrationApiKeys, Environment } = require("transbank-sdk");
+// WebpayPlus.configureForIntegration(IntegrationCommerceCodes.WEBPAY_PLUS, IntegrationApiKeys.WEBPAY, Environment.Integration);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1) Iniciar pago: crea transacción y te devuelvo una URL intermedia que auto-postea
+// body: { amount:number, orderId?:string, callback?:string }
+//  - amount: CLP entero (sin decimales)
+//  - callback: deep link para Expo, p. ej.: "ksapp://pay/return"
+app.post("/payment/start-payment", async (req, res) => {
   try {
-    const { commerceOrder, subject, email, amount } = req.body;
+    const { amount, orderId, callback } = req.body || {};
+    const amt = Number(amount);
 
-    if (!commerceOrder || !subject || !email || !amount) {
-      return res.status(400).json({ error: "Faltan campos requeridos." });
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: "Monto inválido" });
     }
 
-    const payload = {
-      apiKey: FLOW_API_KEY,
-      commerceOrder,
-      subject,
-      currency: "CLP",
-      amount,
-      email,
-      urlConfirmation: URL_CONFIRM,
-      urlReturn: URL_RETURN,
-    };
+    const buyOrder = (orderId && String(orderId)) || `KSA-${Date.now()}`;
+    const sessionId = uuidv4();
 
-    const s = buildSign(payload, FLOW_SECRET_KEY);
+    // Webpay llamará a esta URL con POST token_ws
+    const returnUrl = `${BASE_URL}/payment/webpay-return?cb=${encodeURIComponent(
+      callback || ""
+    )}`;
 
-    const { data } = await axios.post(`${FLOW_BASE}/payment/create`, {
-      ...payload,
-      s,
-    });
+    // Crea la transacción
+    const resp = await new WebpayPlus.Transaction().create(
+      buyOrder,
+      sessionId,
+      Math.round(amt), // CLP → entero
+      returnUrl
+    );
 
-    // Flow devuelve { token, url }
-    if (!data?.token || !data?.url) {
-      return res.status(500).json({ error: "Respuesta inválida de Flow." });
-    }
+    // En móvil no podemos hacer form POST directo, así que usamos el "forward"
+    const forwardUrl = `${BASE_URL}/payment/forward/${resp.token}`;
 
     return res.json({
-      token: data.token,
-      redirectUrl: `${data.url}?token=${data.token}`,
+      forwardUrl,        // 👉 abre esto con WebBrowser.openAuthSessionAsync(forwardUrl, callback)
+      token: resp.token, // por si lo quieres loguear
+      buyOrder,
+      amount: amt,
     });
   } catch (err) {
-    console.error("Flow create error:", err?.response?.data || err.message);
-    return res.status(500).json({
-      error: "No se pudo crear la orden en Flow.",
-      detail: err?.response?.data || err.message,
-    });
+    console.error("[start-payment] error:", err);
+    return res.status(500).json({ error: "No se pudo iniciar la transacción" });
   }
 });
 
-/**
- * Consulta de estado por token (para usar al volver a la app)
- */
-app.get("/api/payments/flow/status/:token", async (req, res) => {
-  try {
-    const { token } = req.params;
-    const payload = { apiKey: FLOW_API_KEY, token };
-    const s = buildSign(payload, FLOW_SECRET_KEY);
+// ─────────────────────────────────────────────────────────────────────────────
+// 2) Página intermedia: auto-POST a Webpay con token_ws
+//    Transbank espera un form POST contra initTransaction con token_ws.
+app.get("/payment/forward/:token", async (req, res) => {
+  const token = req.params.token;
 
-    const { data } = await axios.post(`${FLOW_BASE}/payment/getStatus`, {
-      ...payload,
-      s,
-    });
+  // En producción, el initTransaction es esta URL:
+  const webpayInitUrl = "https://webpay3g.transbank.cl/webpayserver/initTransaction";
 
-    // data.status: 1..5
-    const mapped = mapFlowStatus(data?.status);
-    return res.json({
-      raw: data,
-      status: mapped,
-    });
-  } catch (err) {
-    console.error("Flow status error:", err?.response?.data || err.message);
-    return res.status(500).json({
-      error: "No se pudo consultar el estado en Flow.",
-      detail: err?.response?.data || err.message,
-    });
-  }
+  const html = `
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Redirigiendo a Webpay…</title></head>
+  <body onload="document.forms[0].submit()" style="font-family:system-ui, sans-serif">
+    <p>Redirigiendo a Webpay…</p>
+    <form method="post" action="${webpayInitUrl}">
+      <input type="hidden" name="token_ws" value="${token}" />
+      <noscript><button type="submit">Continuar</button></noscript>
+    </form>
+  </body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
 });
 
-/**
- * Webhook de confirmación (Flow POSTEA aquí)
- * IMPORTANTE: validar firma (s) para seguridad.
- * Si quieres actualizar Firestore desde el backend, lo puedes hacer acá.
- */
-app.post("/api/payments/flow/confirm", async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// 3) Return URL: Webpay POSTea token_ws aquí. Hacemos commit y redirigimos a tu deep link.
+app.post("/payment/webpay-return", async (req, res) => {
   try {
-    const body = req.body || {};
-    const { s: signatureFromFlow, ...rest } = body;
+    const token = req.body.token_ws;
+    const cb = req.query.cb ? String(req.query.cb) : ""; // deep link, ej: ksapp://pay/return
 
-    // Verifica firma
-    const localSign = buildSign(rest, FLOW_SECRET_KEY);
-    if (localSign !== signatureFromFlow) {
-      console.warn("Firma inválida en webhook Flow");
-      return res.status(400).send("Bad signature");
+    if (!token) {
+      return res.status(400).send("Falta token_ws");
     }
 
-    // Opcional: pedir estado definitivo a Flow (buena práctica)
-    // NOTA: rest.token viene en el body.
-    if (!rest.token) {
-      return res.status(400).send("Missing token");
+    const commit = await new WebpayPlus.Transaction().commit(token);
+
+    const success =
+      commit?.response_code === 0 && String(commit?.status).toUpperCase() === "AUTHORIZED";
+
+    // Si definiste deep link, vuelve a la app (cierra navegador en Expo)
+    if (cb) {
+      const u =
+        cb +
+        `?status=${success ? "success" : "failed"}` +
+        `&amount=${encodeURIComponent(commit.amount)}` +
+        `&order=${encodeURIComponent(commit.buy_order)}` +
+        `&token_ws=${encodeURIComponent(token)}` +
+        `&code=${encodeURIComponent(commit.response_code)}`;
+
+      const html = `
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>${success ? "Pago aprobado" : "Pago rechazado"}</title></head>
+  <body style="font-family:system-ui, sans-serif">
+    <p>${success ? "Pago aprobado ✅" : "Pago rechazado ❌"}. Volviendo a la app…</p>
+    <script>window.location.replace(${JSON.stringify(u)});</script>
+  </body>
+</html>`;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.send(html);
     }
 
-    const statusPayload = { apiKey: FLOW_API_KEY, token: rest.token };
-    const s = buildSign(statusPayload, FLOW_SECRET_KEY);
-    const { data } = await axios.post(`${FLOW_BASE}/payment/getStatus`, {
-      ...statusPayload,
-      s,
-    });
-
-    const finalStatus = mapFlowStatus(data?.status);
-
-    // === (OPCIONAL) Actualizar Firestore desde el backend ===
-    // const admin = require("firebase-admin");
-    // if (!admin.apps.length) {
-    //   admin.initializeApp({
-    //     // Si estás en Render/Cloud Run con credenciales por variable de entorno:
-    //     credential: admin.credential.applicationDefault(),
-    //   });
-    // }
-    // const db = admin.firestore();
-    // await db.collection("orders").doc(rest.commerceOrder).set(
-    //   {
-    //     flow: data,
-    //     status: finalStatus,
-    //     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    //   },
-    //   { merge: true }
-    // );
-
-    // Flow requiere 200 OK con texto "OK"
-    return res.status(200).send("OK");
+    // Si no hay deep link, responde JSON (útil para pruebas en navegador)
+    return res.json({ ok: success, commit });
   } catch (err) {
-    console.error("Flow confirm error:", err?.response?.data || err.message);
-    // Igual respondemos 200 OK para no provocar reintentos infinitos, pero logueamos
-    return res.status(200).send("OK");
+    console.error("[webpay-return] error:", err);
+    return res.status(500).send("Error al confirmar transacción");
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`KSAPP backend running on :${PORT}`);
-});
+// Healthcheck
+app.get("/", (_req, res) => res.send("KSAPP backend running"));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`KSAPP backend on :${PORT}`));

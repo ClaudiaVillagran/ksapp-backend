@@ -6,7 +6,16 @@ import crypto from "crypto";
 import "dotenv/config";
 
 const app = express();
-app.use(cors());
+
+// ——— CORS amplio (ajusta origins si quieres) ———
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -39,7 +48,7 @@ app.get("/diag/env", (_, res) =>
     hasFlowApi: !!FLOW_API_KEY,
     hasFlowSecret: !!FLOW_SECRET_KEY,
     urlReturn: URL_RETURN || null,
-    urlConfirm: URL_CONFIRM || null
+    urlConfirm: URL_CONFIRM || null,
   })
 );
 
@@ -51,7 +60,7 @@ app.post("/api/payments/flow/create", async (req, res) => {
     if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
       return res.status(500).json({ ok: false, error: "Faltan llaves de Flow en ENV" });
     }
-    if (!amount || !email || !orderId) {
+    if (!amount && amount !== 0 || !email || !orderId) {
       return res.status(400).json({ ok: false, error: "amount, email y orderId son obligatorios" });
     }
 
@@ -67,7 +76,7 @@ app.post("/api/payments/flow/create", async (req, res) => {
       amount: Number(amount),
       email: String(email),
       urlReturn: URL_RETURN || "https://ksa.cl/pago-retorno",
-      urlConfirmation: URL_CONFIRM || "https://ksapp-backend.onrender.com/api/payments/flow/confirm"
+      urlConfirmation: URL_CONFIRM || "https://ksapp-backend.onrender.com/api/payments/flow/confirm",
     };
 
     const s = flowSign(base, FLOW_SECRET_KEY);
@@ -75,7 +84,7 @@ app.post("/api/payments/flow/create", async (req, res) => {
 
     const r = await axios.post(FLOW_CREATE_URL, body, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 20000
+      timeout: 20000,
     });
 
     if (!r?.data?.url || !r?.data?.token) {
@@ -92,10 +101,11 @@ app.post("/api/payments/flow/create", async (req, res) => {
   }
 });
 
-// Webhook (confirmación de Flow) – opcional, lo dejamos “ok”
+// Webhook (confirmación de Flow) – opcional
 app.get("/api/payments/flow/confirm", (_, res) =>
   res.send("Webhook listo. Usa POST con 'token'.")
 );
+
 app.post("/api/payments/flow/confirm", async (req, res) => {
   try {
     const token = req.body?.token || req.query?.token;
@@ -107,29 +117,57 @@ app.post("/api/payments/flow/confirm", async (req, res) => {
   }
 });
 
-// Endpoint para consultar estado por token (el frontend lo llama)
-app.post("/api/payments/flow/check", async (req, res) => {
+// ——— Utilidad compartida: consultar estado por token ———
+async function getFlowStatusByToken(token) {
+  if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
+    throw new Error("Faltan llaves de Flow en ENV");
+  }
+  const base = { apiKey: FLOW_API_KEY, token: String(token) };
+  const s = flowSign(base, FLOW_SECRET_KEY);
+  const body = new URLSearchParams({ ...base, s }).toString();
+
+  const statusResp = await axios.post(FLOW_STATUS_URL, body, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 20000,
+  });
+
+  // status: 1=creada | 2=pagada | 3=rechazada | 4=anulada
+  const st = statusResp.data;
+  const status = Number(st?.status) || null;
+  const paid = status === 2;
+
+  return { ok: true, paid, status, raw: st };
+}
+
+// ——— Endpoint original: acepta GET y POST ———
+app.all("/api/payments/flow/check", async (req, res) => {
   try {
-    const { token } = req.body;
-    if (!token) return res.status(400).json({ ok: false, error: "token es obligatorio" });
-
-    const base = { apiKey: FLOW_API_KEY, token: String(token) };
-    const s = flowSign(base, FLOW_SECRET_KEY);
-    const body = new URLSearchParams({ ...base, s }).toString();
-
-    const statusResp = await axios.post(FLOW_STATUS_URL, body, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 20000
-    });
-
-    // status: 2 = pagado (según doc)
-    const st = statusResp.data;
-    const paid = Number(st?.status) === 2;
-
-    return res.json({ ok: true, paid, flowStatus: st?.status, raw: st });
+    const token = req.body?.token || req.query?.token;
+    if (!token) {
+      return res.status(400).json({ ok: false, error: "token es obligatorio" });
+    }
+    const result = await getFlowStatusByToken(token);
+    return res.json(result);
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
     console.error("FLOW check error:", detail);
+    return res.status(500).json({ ok: false, error: detail });
+  }
+});
+
+// ——— Alias compatible con tu frontend: GET /status ———
+app.get("/api/payments/flow/status", async (req, res) => {
+  try {
+    const token = req.query?.token;
+    if (!token) {
+      return res.status(400).json({ ok: false, error: "token es obligatorio" });
+    }
+    const result = await getFlowStatusByToken(token);
+    // Agregamos un flag para que veas por dónde vino
+    return res.json({ via: "GET/status", ...result });
+  } catch (err) {
+    const detail = err?.response?.data || err.message || String(err);
+    console.error("FLOW status error:", detail);
     return res.status(500).json({ ok: false, error: detail });
   }
 });

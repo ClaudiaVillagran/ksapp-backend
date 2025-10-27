@@ -13,7 +13,7 @@ const {
 const { v4: uuidv4 } = require("uuid");
 
 // ================== CONFIG (hardcode por ahora) ==================
-const TBK_ENV = "integration"; // "integration" | "production"
+const TBK_ENV = "production"; // "integration" | "production"
 
 // Credenciales producción (rellenar cuando pases a prod)
 const PROD_COMMERCE_CODE = "597050513381";

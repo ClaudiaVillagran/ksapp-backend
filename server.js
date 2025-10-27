@@ -1,42 +1,50 @@
 // server.js
-// Versión: funcional, acepta GET/POST, alias /webpay-retorno, integración por defecto.
+// Webpay Plus v5 — integración por defecto, handler robusto (GET/POST, alias, double-encode callback)
 
 const express = require("express");
 const cors = require("cors");
-const { WebpayPlus, Options, Environment, IntegrationCommerceCodes, IntegrationApiKeys } = require("transbank-sdk");
+const {
+  WebpayPlus,
+  Options,
+  Environment,
+  IntegrationCommerceCodes,
+  IntegrationApiKeys,
+} = require("transbank-sdk");
 const { v4: uuidv4 } = require("uuid");
 
-// -------------------- CONFIG (hardcoded por ahora) --------------------
-// Modo: "integration" o "production"
-const TBK_ENV = "integration"; // <-- cambia a "production" si pasas a prod
+// ================== CONFIG (hardcode por ahora) ==================
+const TBK_ENV = "integration"; // "integration" | "production"
 
-// Si TBK_ENV === "production", rellena con tus credenciales reales.
-// Por ahora usamos credenciales/commerce code de INTEGRACIÓN por defecto.
-const PROD_COMMERCE_CODE = "597050513381"; // <- opcional placeholder producción
-const PROD_API_KEY = "515bda59-40b0-483f-acd0-6d305bc183af"; // <- opcional placeholder producción
+// Credenciales producción (rellenar cuando pases a prod)
+const PROD_COMMERCE_CODE = "597050513381";
+const PROD_API_KEY = "515bda59-40b0-483f-acd0-6d305bc183af";
 
-// Integración (valores públicos del SDK / ejemplos)
-const INTEGRATION_COMMERCE_CODE = IntegrationCommerceCodes.WEBPAY_PLUS || "597056000000";
-const INTEGRATION_API_KEY = IntegrationApiKeys.WEBPAY || "579B532A7440BB0C9079DED94D31EA1615BACEB6";
+// Credenciales integración (del SDK)
+const INTEGRATION_COMMERCE_CODE = IntegrationCommerceCodes.WEBPAY_PLUS; // "597050000541"
+const INTEGRATION_API_KEY = IntegrationApiKeys.WEBPAY;                  // "579B532A7440BB0C9079DED94D31EA1615BACEB6"
 
-// BASE_URL de TU backend público (sin slash final)
-const BASE_URL = "https://ksapp-backend.onrender.com"; // <- tu backend en Render
+// Tu backend público (sin slash final)
+const BASE_URL = "https://ksapp-backend.onrender.com"; // Render
 
-// ---------------------------------------------------------------------
+// ===============================================================
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const ENVIRONMENT = TBK_ENV === "production" ? Environment.Production : Environment.Integration;
-const COMMERCE_CODE = TBK_ENV === "production" ? PROD_COMMERCE_CODE : INTEGRATION_COMMERCE_CODE;
-const API_KEY = TBK_ENV === "production" ? PROD_API_KEY : INTEGRATION_API_KEY;
+const ENVIRONMENT =
+  TBK_ENV === "production" ? Environment.Production : Environment.Integration;
+
+const COMMERCE_CODE =
+  TBK_ENV === "production" ? PROD_COMMERCE_CODE : INTEGRATION_COMMERCE_CODE;
+
+const API_KEY =
+  TBK_ENV === "production" ? PROD_API_KEY : INTEGRATION_API_KEY;
 
 const TBK_OPTIONS = new Options(COMMERCE_CODE, API_KEY, ENVIRONMENT);
+console.log(`[TBK] env=${TBK_ENV} commerce=${COMMERCE_CODE}`);
 
-console.log(`Transbank env: ${TBK_ENV} (commerce: ${COMMERCE_CODE})`);
-
-// -------------------- 1) Iniciar pago --------------------
+// ============ 1) Crear transacción ============
 app.post("/payment/start-payment", async (req, res) => {
   try {
     const { amount, orderId, callback } = req.body || {};
@@ -45,15 +53,17 @@ app.post("/payment/start-payment", async (req, res) => {
       return res.status(400).json({ error: "Monto inválido" });
     }
 
+    // ⚠️ Doble encode del callback para que Transbank NO lo confunda con el path
+    const cb = callback ? encodeURIComponent(encodeURIComponent(String(callback))) : "";
+
     const buyOrder = (orderId && String(orderId)) || `KSA-${Date.now()}`;
     const sessionId = uuidv4();
-    const returnUrl = `${BASE_URL}/payment/webpay-return?cb=${encodeURIComponent(callback || "")}`;
+    const returnUrl = `${BASE_URL}/payment/webpay-return${cb ? `?cb=${cb}` : ""}`;
 
     const tx = new WebpayPlus.Transaction(TBK_OPTIONS);
     const resp = await tx.create(buyOrder, sessionId, Math.round(amt), returnUrl);
 
     const forwardUrl = `${BASE_URL}/payment/forward/${resp.token}`;
-
     return res.json({
       env: TBK_ENV,
       forwardUrl,
@@ -67,8 +77,8 @@ app.post("/payment/start-payment", async (req, res) => {
   }
 });
 
-// -------------------- 2) Página intermedia (auto-post a Webpay) --------------------
-app.get("/payment/forward/:token", async (req, res) => {
+// ============ 2) Página intermedia (auto-POST a Webpay) ============
+app.get("/payment/forward/:token", (req, res) => {
   const token = req.params.token;
   const webpayInitUrl =
     ENVIRONMENT === Environment.Production
@@ -78,7 +88,7 @@ app.get("/payment/forward/:token", async (req, res) => {
   const html = `<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>Redirigiendo a Webpay...</title></head>
-<body onload="document.forms[0].submit()" style="font-family:system-ui, sans-serif">
+<body onload="document.forms[0].submit()" style="font-family:system-ui,sans-serif">
   <p>Redirigiendo a Webpay (${TBK_ENV})...</p>
   <form method="post" action="${webpayInitUrl}">
     <input type="hidden" name="token_ws" value="${token}" />
@@ -90,19 +100,25 @@ app.get("/payment/forward/:token", async (req, res) => {
   res.send(html);
 });
 
-// -------------------- 3) Retorno Webpay (GET/POST) --------------------
+// ============ 3) Retorno Webpay (commit + deep link) ============
+// Acepta GET y POST. Lee token_ws de body o query. Decodifica callback doble.
 app.all("/payment/webpay-return", async (req, res) => {
   try {
-    const cb = req.query.cb ? String(req.query.cb) : "";
+    // ⚠️ Doble decode del callback
+    const cbRaw = (req.query && req.query.cb) ? String(req.query.cb) : "";
+    const cb = cbRaw ? decodeURIComponent(decodeURIComponent(cbRaw)) : "";
+
     const token =
       (req.body && req.body.token_ws) ||
       (req.query && (req.query.token_ws || req.query.TBK_TOKEN));
 
     if (!token) {
-      // Cancelado o retorno inválido (sin token)
       if (cb) {
         const failUrl = `${cb}?status=failed&code=NO_TOKEN`;
-        const html = `<!doctype html><html><body><p>Pago cancelado ❌. Volviendo a la app...</p><script>location.replace(${JSON.stringify(failUrl)});</script></body></html>`;
+        const html = `<!doctype html><html><body>
+<p>Pago cancelado ❌. Volviendo a la app...</p>
+<script>location.replace(${JSON.stringify(failUrl)});</script>
+</body></html>`;
         res.setHeader("Content-Type", "text/html; charset=utf-8");
         return res.send(html);
       }
@@ -112,7 +128,9 @@ app.all("/payment/webpay-return", async (req, res) => {
     const tx = new WebpayPlus.Transaction(TBK_OPTIONS);
     const commit = await tx.commit(token);
 
-    const success = commit?.response_code === 0 && String(commit?.status).toUpperCase() === "AUTHORIZED";
+    const success =
+      commit?.response_code === 0 &&
+      String(commit?.status).toUpperCase() === "AUTHORIZED";
 
     if (cb) {
       const u =
@@ -122,12 +140,15 @@ app.all("/payment/webpay-return", async (req, res) => {
         `&order=${encodeURIComponent(commit.buy_order ?? "")}` +
         `&token_ws=${encodeURIComponent(token)}` +
         `&code=${encodeURIComponent(commit.response_code ?? "")}`;
-
-      const html = `<!doctype html><html><body><p>${success ? "Pago aprobado ✅" : "Pago rechazado ❌"}. Volviendo a la app...</p><script>location.replace(${JSON.stringify(u)});</script></body></html>`;
+      const html = `<!doctype html><html><body>
+<p>${success ? "Pago aprobado ✅" : "Pago rechazado ❌"}. Volviendo a la app...</p>
+<script>location.replace(${JSON.stringify(u)});</script>
+</body></html>`;
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       return res.send(html);
     }
 
+    // Si no hay deep link, responde JSON (debug)
     return res.json({ ok: success, commit });
   } catch (err) {
     console.error("[webpay-return] error:", err);
@@ -135,15 +156,14 @@ app.all("/payment/webpay-return", async (req, res) => {
   }
 });
 
-// -------------------- Alias en caso de 'webpay-retorno' --------------------
+// Alias por si en Transbank configuraron "webpay-retorno"
 app.all("/payment/webpay-retorno", (req, res) => {
-  // reenviamos a /payment/webpay-return
   req.url = "/payment/webpay-return" + (req.url.includes("?") ? "&" : "?") + "compat=1";
   app.handle(req, res);
 });
 
-// -------------------- Healthcheck --------------------
+// Healthcheck
 app.get("/", (_req, res) => res.send(`KSAPP backend running (${TBK_ENV})`));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`KSAPP backend on :${PORT} (TBK_ENV=${TBK_ENV})`));
+app.listen(PORT, () => console.log(`KSAPP backend on :${PORT} (env=${TBK_ENV})`));

@@ -7,7 +7,7 @@ import "dotenv/config";
 
 const app = express();
 
-// ——— CORS amplio (ajusta origins si quieres) ———
+// CORS (ajusta origins si quieres)
 app.use(
   cors({
     origin: "*",
@@ -58,14 +58,13 @@ app.post("/api/payments/flow/create", async (req, res) => {
     const { amount, email, orderId, description } = req.body;
 
     if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
-      return res.status(500).json({ ok: false, error: "Faltan llaves de Flow en ENV" });
+      return res.status(200).json({ ok: false, status: null, paid: false, raw: null, error: "Faltan llaves de Flow en ENV", transient: false });
     }
-    if (!amount && amount !== 0 || !email || !orderId) {
-      return res.status(400).json({ ok: false, error: "amount, email y orderId son obligatorios" });
+    if ((!amount && amount !== 0) || !email || !orderId) {
+      return res.status(200).json({ ok: false, status: null, paid: false, raw: null, error: "amount, email y orderId son obligatorios", transient: false });
     }
 
     // Reglas Flow:
-    // - commerceOrder <= 45 chars
     const safeOrder = String(orderId).slice(0, 45);
 
     const base = {
@@ -89,7 +88,7 @@ app.post("/api/payments/flow/create", async (req, res) => {
 
     if (!r?.data?.url || !r?.data?.token) {
       console.error("FLOW create unexpected:", r?.data);
-      return res.status(502).json({ ok: false, error: "Flow no devolvió url/token" });
+      return res.status(200).json({ ok: false, status: null, paid: false, raw: r?.data || null, error: "Flow no devolvió url/token", transient: false });
     }
 
     const paymentUrl = `${r.data.url}?token=${r.data.token}`;
@@ -97,7 +96,7 @@ app.post("/api/payments/flow/create", async (req, res) => {
   } catch (err) {
     const detail = err?.response?.data || err.message || String(err);
     console.error("FLOW create error:", detail);
-    return res.status(500).json({ ok: false, error: detail });
+    return res.status(200).json({ ok: false, status: null, paid: false, raw: detail, error: typeof detail === "string" ? detail : (detail?.message || "Error creando pago en Flow"), transient: false });
   }
 });
 
@@ -111,65 +110,69 @@ app.post("/api/payments/flow/confirm", async (req, res) => {
     const token = req.body?.token || req.query?.token;
     if (!token) return res.sendStatus(400);
     console.log("Confirmación Flow recibida. token:", token);
+    // Aquí podrías consultar getStatus y actualizar tu BD.
     return res.sendStatus(200);
   } catch {
     return res.sendStatus(500);
   }
 });
 
-// ——— Utilidad compartida: consultar estado por token ———
+// Utilidad: consultar estado por token (shape estable)
 async function getFlowStatusByToken(token) {
   if (!FLOW_API_KEY || !FLOW_SECRET_KEY) {
-    throw new Error("Faltan llaves de Flow en ENV");
+    return { ok: false, status: null, paid: false, raw: null, error: "Faltan llaves de Flow en ENV", transient: false };
   }
-  const base = { apiKey: FLOW_API_KEY, token: String(token) };
-  const s = flowSign(base, FLOW_SECRET_KEY);
-  const body = new URLSearchParams({ ...base, s }).toString();
+  try {
+    const base = { apiKey: FLOW_API_KEY, token: String(token) };
+    const s = flowSign(base, FLOW_SECRET_KEY);
+    const body = new URLSearchParams({ ...base, s }).toString();
 
-  const statusResp = await axios.post(FLOW_STATUS_URL, body, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 20000,
-  });
+    const statusResp = await axios.post(FLOW_STATUS_URL, body, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 20000,
+    });
 
-  // status: 1=creada | 2=pagada | 3=rechazada | 4=anulada
-  const st = statusResp.data;
-  const status = Number(st?.status) || null;
-  const paid = status === 2;
+    const st = statusResp.data;                 // Respuesta de Flow
+    const status = Number(st?.status) || null;  // 1,2,3,4
+    const paid = status === 2;
 
-  return { ok: true, paid, status, raw: st };
+    console.log("[FLOW:getStatus] ok token=", token, "status=", status);
+    return { ok: true, status, paid, raw: st, error: null, transient: false };
+  } catch (err) {
+    const detail = err?.response?.data || err.message || String(err);
+    const isObj = typeof detail === "object" && detail !== null;
+    const code = isObj ? Number(detail.code) : null;
+    const isTransient = code === 105 || (isObj && /No services available/i.test(detail?.message || ""));
+    console.error("[FLOW:getStatus] ERROR token=", token, "detail=", detail);
+    return {
+      ok: false,
+      status: null,
+      paid: false,
+      raw: detail,
+      error: isObj ? (detail?.message || "Error consultando Flow") : String(detail),
+      transient: !!isTransient,
+    };
+  }
 }
 
-// ——— Endpoint original: acepta GET y POST ———
+// Endpoint que acepta GET y POST (shape estable)
 app.all("/api/payments/flow/check", async (req, res) => {
-  try {
-    const token = req.body?.token || req.query?.token;
-    if (!token) {
-      return res.status(400).json({ ok: false, error: "token es obligatorio" });
-    }
-    const result = await getFlowStatusByToken(token);
-    return res.json(result);
-  } catch (err) {
-    const detail = err?.response?.data || err.message || String(err);
-    console.error("FLOW check error:", detail);
-    return res.status(500).json({ ok: false, error: detail });
+  const token = req.body?.token || req.query?.token;
+  if (!token) {
+    return res.status(200).json({ ok: false, status: null, paid: false, raw: null, error: "token es obligatorio", transient: false });
   }
+  const result = await getFlowStatusByToken(token);
+  return res.status(200).json({ via: "CHECK", ...result });
 });
 
-// ——— Alias compatible con tu frontend: GET /status ———
+// Alias compatible con el frontend: GET /status
 app.get("/api/payments/flow/status", async (req, res) => {
-  try {
-    const token = req.query?.token;
-    if (!token) {
-      return res.status(400).json({ ok: false, error: "token es obligatorio" });
-    }
-    const result = await getFlowStatusByToken(token);
-    // Agregamos un flag para que veas por dónde vino
-    return res.json({ via: "GET/status", ...result });
-  } catch (err) {
-    const detail = err?.response?.data || err.message || String(err);
-    console.error("FLOW status error:", detail);
-    return res.status(500).json({ ok: false, error: detail });
+  const token = req.query?.token;
+  if (!token) {
+    return res.status(200).json({ ok: false, status: null, paid: false, raw: null, error: "token es obligatorio", transient: false });
   }
+  const result = await getFlowStatusByToken(token);
+  return res.status(200).json({ via: "GET/status", ...result });
 });
 
 const REAL_PORT = PORT || 3000;

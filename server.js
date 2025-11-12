@@ -1,5 +1,3 @@
-// server.js
-// Webpay Plus v5 — integración por defecto, handler robusto (GET/POST, alias, double-encode callback)
 
 const express = require("express");
 const cors = require("cors");
@@ -11,22 +9,18 @@ const {
   IntegrationApiKeys,
 } = require("transbank-sdk");
 const { v4: uuidv4 } = require("uuid");
+const cloudinary = require("cloudinary").v2;
 
-// ================== CONFIG (hardcode por ahora) ==================
 const TBK_ENV = "production"; // "integration" | "production"
 
-// Credenciales producción (rellenar cuando pases a prod)
-const PROD_COMMERCE_CODE = "597050513381";
-const PROD_API_KEY = "515bda59-40b0-483f-acd0-6d305bc183af";
+const PROD_COMMERCE_CODE = process.env.PROD_COMMERCE_CODE;
+const PROD_API_KEY = process.env.PROD_API_KEY;
 
-// Credenciales integración (del SDK)
-const INTEGRATION_COMMERCE_CODE = IntegrationCommerceCodes.WEBPAY_PLUS; // "597050000541"
-const INTEGRATION_API_KEY = IntegrationApiKeys.WEBPAY;                  // "579B532A7440BB0C9079DED94D31EA1615BACEB6"
+const INTEGRATION_COMMERCE_CODE = IntegrationCommerceCodes.WEBPAY_PLUS; 
+const INTEGRATION_API_KEY = IntegrationApiKeys.WEBPAY;              
 
-// Tu backend público (sin slash final)
 const BASE_URL = "https://ksapp-backend.onrender.com"; // Render
 
-// ===============================================================
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -53,7 +47,6 @@ app.post("/payment/start-payment", async (req, res) => {
       return res.status(400).json({ error: "Monto inválido" });
     }
 
-    // ⚠️ Doble encode del callback para que Transbank NO lo confunda con el path
     const cb = callback ? encodeURIComponent(encodeURIComponent(String(callback))) : "";
 
     const buyOrder = (orderId && String(orderId)) || `KSA-${Date.now()}`;
@@ -77,7 +70,6 @@ app.post("/payment/start-payment", async (req, res) => {
   }
 });
 
-// ============ 2) Página intermedia (auto-POST a Webpay) ============
 app.get("/payment/forward/:token", (req, res) => {
   const token = req.params.token;
   const webpayInitUrl =
@@ -100,8 +92,6 @@ app.get("/payment/forward/:token", (req, res) => {
   res.send(html);
 });
 
-// ============ 3) Retorno Webpay (commit + deep link) ============
-// Acepta GET y POST. Lee token_ws de body o query. Decodifica callback doble.
 app.all("/payment/webpay-return", async (req, res) => {
   try {
     // ⚠️ Doble decode del callback
@@ -148,7 +138,6 @@ app.all("/payment/webpay-return", async (req, res) => {
       return res.send(html);
     }
 
-    // Si no hay deep link, responde JSON (debug)
     return res.json({ ok: success, commit });
   } catch (err) {
     console.error("[webpay-return] error:", err);
@@ -156,14 +145,50 @@ app.all("/payment/webpay-return", async (req, res) => {
   }
 });
 
-// Alias por si en Transbank configuraron "webpay-retorno"
 app.all("/payment/webpay-retorno", (req, res) => {
   req.url = "/payment/webpay-return" + (req.url.includes("?") ? "&" : "?") + "compat=1";
   app.handle(req, res);
 });
 
-// Healthcheck
 app.get("/", (_req, res) => res.send(`KSAPP backend running (${TBK_ENV})`));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`KSAPP backend on :${PORT} (env=${TBK_ENV})`));
+
+
+
+// Cloud
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const isSafeInt = (n) => Number.isInteger(n) && n > 0;
+
+app.get("/cloudinary/signature", (req, res) => {
+  try {
+    const timestamp = Math.floor(Date.now() / 1000);
+
+    const paramsToSign = {
+      timestamp,
+      folder: process.env.CLOUDINARY_FOLDER || "ksa/uploads",
+    };
+
+    const signature = cloudinary.utils.api_sign_request(
+      paramsToSign,
+      process.env.CLOUDINARY_API_SECRET
+    );
+
+    res.json({
+      cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+      apiKey: process.env.CLOUDINARY_API_KEY,
+      timestamp,
+      signature,
+      params: paramsToSign,
+    });
+  } catch (err) {
+    console.error("[cloudinary/signature] error:", err);
+    res.status(500).json({ error: "No se pudo firmar la solicitud" });
+  }
+});
